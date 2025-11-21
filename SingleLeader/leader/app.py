@@ -83,6 +83,7 @@ class ReadResponse(BaseModel):
     value: str
 
 
+
 async def replicate_to_follower(
         client: httpx.AsyncClient,
         follower_url: str,
