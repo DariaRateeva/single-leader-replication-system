@@ -1,25 +1,31 @@
 version: '3.8'
 
 services:
+  # Leader node - accepts writes and replicates to followers
   leader:
-    build: ./leader
+    build:
+      context: ./leader
+      dockerfile: Dockerfile
     container_name: leader
     ports:
       - "8000:8000"
     environment:
       - WRITE_QUORUM=${WRITE_QUORUM:-3}
-      - MIN_DELAY=${MIN_DELAY:-0.0001}
-      - MAX_DELAY=${MAX_DELAY:-0.001}
+      - MIN_DELAY=${MIN_DELAY:-0.01}
+      - MAX_DELAY=${MAX_DELAY:-0.05}
     networks:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
+  # Follower 1
   follower1:
-    build: ./follower
+    build:
+      context: ./follower
+      dockerfile: Dockerfile
     container_name: follower1
     environment:
       - FOLLOWER_ID=follower1
@@ -27,12 +33,15 @@ services:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
+  # Follower 2
   follower2:
-    build: ./follower
+    build:
+      context: ./follower
+      dockerfile: Dockerfile
     container_name: follower2
     environment:
       - FOLLOWER_ID=follower2
@@ -40,12 +49,15 @@ services:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
+  # Follower 3
   follower3:
-    build: ./follower
+    build:
+      context: ./follower
+      dockerfile: Dockerfile
     container_name: follower3
     environment:
       - FOLLOWER_ID=follower3
@@ -53,12 +65,15 @@ services:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
+  # Follower 4
   follower4:
-    build: ./follower
+    build:
+      context: ./follower
+      dockerfile: Dockerfile
     container_name: follower4
     environment:
       - FOLLOWER_ID=follower4
@@ -66,12 +81,15 @@ services:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
+  # Follower 5
   follower5:
-    build: ./follower
+    build:
+      context: ./follower
+      dockerfile: Dockerfile
     container_name: follower5
     environment:
       - FOLLOWER_ID=follower5
@@ -79,8 +97,8 @@ services:
       - replication-net
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
-      interval: 10s
-      timeout: 5s
+      interval: 5s
+      timeout: 3s
       retries: 3
 
 networks:
