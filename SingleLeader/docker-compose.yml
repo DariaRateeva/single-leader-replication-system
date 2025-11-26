@@ -27,6 +27,8 @@ services:
       context: ./follower
       dockerfile: Dockerfile
     container_name: follower1
+    ports:
+      - "8001:8000"  # Exposed for race condition verification test
     environment:
       - FOLLOWER_ID=follower1
     networks:

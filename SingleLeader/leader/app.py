@@ -36,11 +36,13 @@ async def lifespan(app: FastAPI):
     logger.info(f"✓ HTTP client closed in {duration:.2f}ms")
 
 
-# Create FastAPI app with lifespan (ONLY ONCE!)
+# Create FastAPI app with lifespan
 app = FastAPI(title="Leader Key-Value Store", lifespan=lifespan)
 
-# In-memory key-value store
+# In-memory key-value store and version tracking
 store: Dict[str, str] = {}
+key_versions: Dict[str, int] = {}  # Tracks the latest version for each key
+version_lock = asyncio.Lock()  # Ensures atomic version updates
 
 # Configuration from environment variables
 WRITE_QUORUM = int(os.getenv("WRITE_QUORUM", "3"))
@@ -67,21 +69,23 @@ class WriteRequest(BaseModel):
 class ReplicationRequest(BaseModel):
     key: str
     value: str
+    version: int  # Added version field
 
 
 class WriteResponse(BaseModel):
     status: str
     key: str
     value: str
+    version: int  # Return version to client for verification
     acks_received: int
     required_acks: int
-    timing: dict  # Added timing information
+    timing: dict
 
 
 class ReadResponse(BaseModel):
     key: str
     value: str
-
+    version: int
 
 
 async def replicate_to_follower(
@@ -89,6 +93,7 @@ async def replicate_to_follower(
         follower_url: str,
         key: str,
         value: str,
+        version: int,
         request_id: str
 ) -> tuple[bool, float, float]:
     """
@@ -104,11 +109,11 @@ async def replicate_to_follower(
         await asyncio.sleep(delay)
         delay_duration = (time.time() - delay_start) * 1000
 
-        # Send replication request
+        # Send replication request with VERSION
         request_start = time.time()
         response = await client.post(
             f"{follower_url}/replicate",
-            json={"key": key, "value": value},
+            json={"key": key, "value": value, "version": version},
             timeout=5.0
         )
         request_duration = (time.time() - request_start) * 1000
@@ -141,30 +146,36 @@ async def replicate_to_follower(
 async def write_key_value(request: WriteRequest):
     """
     Write operation: Updates leader's store and replicates to followers.
-    Uses semi-synchronous replication with configurable write quorum.
+    Uses logical clocks (versions) to prevent race conditions.
     """
-    request_id = f"W-{int(time.time() * 1000) % 10000:04d}"  # Short unique ID
+    request_id = f"W-{int(time.time() * 1000) % 10000:04d}"
     operation_start = time.time()
 
     key = request.key
     value = request.value
 
-    logger.info(f"[{request_id}] ═══ WRITE REQUEST STARTED: {key}={value[:20]}... ═══")
-
-    # Step 1: Write to leader's local store
+    # Step 1: Write to leader's local store ATOMICALLY
     step1_start = time.time()
-    store[key] = value
+
+    async with version_lock:
+        current_version = key_versions.get(key, 0) + 1
+        key_versions[key] = current_version
+        store[key] = value
+        write_version = current_version
+
     step1_duration = (time.time() - step1_start) * 1000
+
+    logger.info(f"[{request_id}] ═══ WRITE STARTED: {key}={value[:20]}... (v{write_version}) ═══")
     logger.info(f"[{request_id}] Step 1: Leader write completed in {step1_duration:.3f}ms")
 
     # Step 2: Replicate to all followers concurrently
     step2_start = time.time()
     logger.info(f"[{request_id}] Step 2: Starting replication to {len(FOLLOWER_URLS)} followers")
 
-    # Create tasks for all followers
+    # Create tasks for all followers, passing the VERSION
     pending_tasks = [
         asyncio.create_task(
-            replicate_to_follower(http_client, follower_url, key, value, request_id)
+            replicate_to_follower(http_client, follower_url, key, value, write_version, request_id)
         )
         for follower_url in FOLLOWER_URLS
     ]
@@ -175,14 +186,12 @@ async def write_key_value(request: WriteRequest):
     # Wait for quorum or all tasks to complete
     quorum_start = time.time()
     while len(done_tasks) < WRITE_QUORUM and pending_set:
-        # Wait for next task to complete
         done, pending_set = await asyncio.wait(
             pending_set,
             return_when=asyncio.FIRST_COMPLETED
         )
         done_tasks.extend(done)
 
-        # Log progress
         successful = sum(
             1 for task in done_tasks
             if not task.cancelled() and task.exception() is None and task.result()[0] is True
@@ -194,7 +203,7 @@ async def write_key_value(request: WriteRequest):
 
     quorum_duration = (time.time() - quorum_start) * 1000
 
-    # Count successful acknowledgments and collect timing info
+    # Collect results
     acks_received = 0
     follower_timings = []
 
@@ -214,8 +223,6 @@ async def write_key_value(request: WriteRequest):
         cancel_start = time.time()
         for task in pending_set:
             task.cancel()
-
-        # Wait for cancelled tasks to complete
         await asyncio.gather(*pending_set, return_exceptions=True)
         cancel_duration = (time.time() - cancel_start) * 1000
         logger.info(
@@ -226,16 +233,6 @@ async def write_key_value(request: WriteRequest):
     step2_duration = (time.time() - step2_start) * 1000
     total_duration = (time.time() - operation_start) * 1000
 
-    logger.info(
-        f"[{request_id}] Step 2: Replication completed in {step2_duration:.2f}ms "
-        f"(quorum reached in {quorum_duration:.2f}ms)"
-    )
-    logger.info(
-        f"[{request_id}] Step 3: Acknowledgments: {acks_received}/{len(FOLLOWER_URLS)} "
-        f"(required: {WRITE_QUORUM})"
-    )
-
-    # Step 3: Prepare response
     status = "success" if acks_received >= WRITE_QUORUM else "partial_failure"
 
     timing_info = {
@@ -247,7 +244,7 @@ async def write_key_value(request: WriteRequest):
     }
 
     logger.info(
-        f"[{request_id}] ═══ WRITE REQUEST COMPLETED: {status.upper()} "
+        f"[{request_id}] ═══ COMPLETED: {status.upper()} "
         f"in {total_duration:.2f}ms ═══"
     )
 
@@ -255,6 +252,7 @@ async def write_key_value(request: WriteRequest):
         status=status,
         key=key,
         value=value,
+        version=write_version,
         acks_received=acks_received,
         required_acks=WRITE_QUORUM,
         timing=timing_info
@@ -263,31 +261,24 @@ async def write_key_value(request: WriteRequest):
 
 @app.get("/read/{key}", response_model=ReadResponse)
 async def read_key_value(key: str):
-    """
-    Read operation: Returns value from leader's store.
-    """
     start_time = time.time()
-
     if key not in store:
-        duration = (time.time() - start_time) * 1000
-        logger.warning(f"READ: Key '{key}' not found (took {duration:.3f}ms)")
         raise HTTPException(status_code=404, detail=f"Key '{key}' not found")
 
+    version = key_versions.get(key, 0)
     duration = (time.time() - start_time) * 1000
-    logger.info(f"READ: {key} retrieved in {duration:.3f}ms")
-    return ReadResponse(key=key, value=store[key])
+    logger.info(f"READ: {key} (v{version}) retrieved in {duration:.3f}ms")
+
+    return ReadResponse(key=key, value=store[key], version=version)
 
 
 @app.get("/data")
 async def get_all_data():
-    """
-    Returns all key-value pairs in the leader's store.
-    Used for consistency checking.
-    """
     start_time = time.time()
     data = {
         "role": "leader",
         "data": store,
+        "versions": key_versions,
         "count": len(store)
     }
     duration = (time.time() - start_time) * 1000
@@ -297,7 +288,6 @@ async def get_all_data():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint."""
     return {
         "status": "healthy",
         "role": "leader",
